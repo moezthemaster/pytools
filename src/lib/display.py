@@ -4,7 +4,6 @@
 import colorama
 from src.lib.env import env
 
-# Initialisation de colorama (Windows compatible)
 colorama.init(autoreset=True)
 
 class Display:
@@ -15,6 +14,7 @@ class Display:
     YELLOW = colorama.Fore.YELLOW
     BLUE = colorama.Fore.BLUE
     CYAN = colorama.Fore.CYAN
+    MAGENTA = colorama.Fore.MAGENTA
     RESET = colorama.Fore.RESET
     BOLD = colorama.Style.BRIGHT
     
@@ -36,6 +36,11 @@ class Display:
         
         print()
         print(self._colorize(f"🔌 {env_label} ({host_info})", self.CYAN))
+        
+        # Afficher l'utilisateur cible si différent
+        if result.get('target_user'):
+            print(self._colorize(f"   👤 En tant que : {result['target_user']}", self.MAGENTA))
+        
         print(self._colorize("─────────────────────────────────", self.BOLD))
         
         if result['stdout']:
