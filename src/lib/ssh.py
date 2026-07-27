@@ -51,7 +51,7 @@ class SSHExecutor:
                 'code': -1
             }
     
-    def run_on_env(self, app, env, command, info):
+    def run_on_env(self, app, env, command, info, target_user=None):
         """Exécute une commande sur un environnement"""
         client = self.connect(info['host'], info['user'], info['port'])
         
@@ -62,6 +62,7 @@ class SSHExecutor:
                 'host': info['host'],
                 'user': info['user'],
                 'port': info['port'],
+                'target_user': target_user,
                 'stdout': '',
                 'stderr': client['error'],
                 'code': -1
@@ -76,5 +77,6 @@ class SSHExecutor:
             'host': info['host'],
             'user': info['user'],
             'port': info['port'],
+            'target_user': target_user,
             **result
         }
