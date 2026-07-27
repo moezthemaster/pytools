@@ -10,11 +10,12 @@ from src.lib.env import env
 class SessionManager:
     """Gère l'exécution sur plusieurs environnements"""
     
-    def __init__(self, app, envs, command, password):
+    def __init__(self, app, envs, command, password, target_user=None):
         self.app = app
         self.envs = envs
         self.command = command
         self.password = password
+        self.target_user = target_user
         self.config = ConfigManager()
         self.executor = SSHExecutor(password)
         self.results = []
@@ -25,7 +26,7 @@ class SessionManager:
         """Exécute séquentiellement (une machine après l'autre)"""
         for env in self.envs:
             info = self.config.get_connection_info(self.app, env)
-            result = self.executor.run_on_env(self.app, env, self.command, info)
+            result = self.executor.run_on_env(self.app, env, self.command, info, self.target_user)
             self.results.append(result)
             self.display.show_result(result, show_separator=True)
         self.display.show_summary(self.results)
@@ -36,7 +37,14 @@ class SessionManager:
             futures = {}
             for env in self.envs:
                 info = self.config.get_connection_info(self.app, env)
-                future = pool.submit(self.executor.run_on_env, self.app, env, self.command, info)
+                future = pool.submit(
+                    self.executor.run_on_env,
+                    self.app,
+                    env,
+                    self.command,
+                    info,
+                    self.target_user
+                )
                 futures[future] = env
             
             for future in as_completed(futures):
