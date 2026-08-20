@@ -3,14 +3,13 @@
 
 import sys
 import os
-import tempfile
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
 from uuid import uuid4
 from src.lib.base import BaseTool
 from src.lib.ssh import SSHExecutor
-from src.lib.session import SessionManager
 from src.lib.env import env
 
 class CopyTool(BaseTool):
@@ -20,9 +19,10 @@ class CopyTool(BaseTool):
         super().__init__(args)
         self.recursive = False
         self.target_user = None
-        self.preserve_perms = False
+        self.mode = None
         self.verbose = False
         self.force = False
+        self.preserve = False
         
     def parse_args(self):
         """Parse les arguments de la commande copy"""
@@ -47,8 +47,21 @@ class CopyTool(BaseTool):
                 else:
                     print("❌ L'option -u nécessite un nom d'utilisateur")
                     sys.exit(1)
+            elif arg == "--mode":
+                if i + 1 < len(self.args):
+                    self.mode = self.args[i + 1]
+                    # Valider le mode
+                    try:
+                        int(self.mode, 8)
+                    except ValueError:
+                        print(f"❌ Mode invalide : {self.mode} (ex: 644, 755)")
+                        sys.exit(1)
+                    i += 2
+                else:
+                    print("❌ L'option --mode nécessite une valeur (ex: 644)")
+                    sys.exit(1)
             elif arg in ["-p", "--preserve"]:
-                self.preserve_perms = True
+                self.preserve = True
                 i += 1
             elif arg in ["-v", "--verbose"]:
                 self.verbose = True
@@ -155,30 +168,35 @@ FORMATS:
     Remote  : appli:env:/path/to/file
 
 OPTIONS:
-    -r, --recursive     Copie récursive (répertoires)
-    -u, --user <user>   Utilisateur cible pour la copie (ex: root, devops)
-    -p, --preserve      Préserve les permissions
-    -v, --verbose       Mode verbeux
-    -f, --force         Force la copie (écrase les fichiers existants)
-    -h, --help          Affiche cette aide
+    -r, --recursive         Copie récursive (répertoires)
+    -u, --user <user>       Utilisateur cible pour la copie (ex: root, devops)
+    --mode <mode>           Permissions finales (ex: 600, 644, 755)
+    -p, --preserve          Préserve les permissions source
+    -v, --verbose           Mode verbeux (affiche la progression)
+    -f, --force             Force la copie (écrase les fichiers existants)
+    -h, --help              Affiche cette aide
 
 EXEMPLES:
     # Remote → Local
     copy appli1:prod:/var/log/app.log ./logs/
-    copy appli1:prod:/etc/nginx /tmp/nginx-backup -r -u root
+    copy appli1:prod:/etc/nginx /tmp/nginx-backup -r -u root --mode 755
 
     # Local → Remote
-    copy ./mon_script.sh appli1:prod:/tmp/
-    copy ./conf/ appli1:prod:/etc/app/ -r -u root
+    copy ./mon_script.sh appli1:prod:/tmp/ -u devops --mode 755
+    copy ./conf/ appli1:prod:/etc/app/ -r -u root --mode 644
 
     # Remote → Remote (via local)
-    copy appli1:prod:/etc/config.yml appli2:recette:/etc/config.yml -u root
-    copy appli1:prod:/var/www/ appli2:recette:/var/www/ -r -u root
+    copy appli1:prod:/etc/config.yml appli2:recette:/etc/config.yml -u root --mode 600
+    copy appli1:prod:/var/www/ appli2:recette:/var/www/ -r -u root --mode 755
 """)
     
     def run(self):
         """Exécute la copie selon le flux détecté"""
         self.parse_args()
+        
+        # Demander le mot de passe si on a besoin de SSH
+        if self.src_type == "remote" or self.dst_type == "remote":
+            self.password = self.get_password()
         
         if self.flow == "REMOTE_TO_LOCAL":
             self._copy_remote_to_local()
@@ -195,35 +213,45 @@ EXEMPLES:
         info = self.config.get_connection_info(app, env)
         return info['user'], info['host'], info['port']
     
-    def _execute_ssh(self, app, env, command, input_data=None):
+    def _execute_ssh(self, app, env, command):
         """Exécute une commande SSH et retourne le résultat"""
         user, host, port = self._get_remote_info(app, env)
         
-        # Connexion SSH
-        ssh = SSHExecutor(self.get_password())
+        ssh = SSHExecutor(self.password)
         client = ssh.connect(host, user, port)
         
         if isinstance(client, dict) and 'error' in client:
-            print(f"❌ Erreur de connexion à {app}:{env} : {client['error']}")
-            return None
+            return {'code': -1, 'stdout': '', 'stderr': client['error']}
         
-        # Si commande avec input, utiliser stdin
-        if input_data:
-            stdin, stdout, stderr = client.exec_command(command)
-            stdin.write(input_data)
-            stdin.flush()
-            stdin.channel.shutdown_write()
-        else:
-            stdin, stdout, stderr = client.exec_command(command)
-        
-        result = {
-            'stdout': stdout.read().decode(),
-            'stderr': stderr.read().decode(),
-            'code': stdout.channel.recv_exit_status()
-        }
-        
+        result = ssh.exec_command(client, command)
         client.close()
         return result
+    
+    def _get_default_group(self, app, env, user):
+        """Récupère le groupe par défaut d'un utilisateur"""
+        cmd = f"dersudo du- root -c 'id -gn {user}'"
+        result = self._execute_ssh(app, env, cmd)
+        if result['code'] == 0:
+            return result['stdout'].strip()
+        return user
+    
+    def _set_remote_permissions(self, app, env, path, user, mode):
+        """Définit le propriétaire et les permissions sur un fichier remote"""
+        # Récupérer le groupe par défaut
+        group = self._get_default_group(app, env, user)
+        
+        # Changer le propriétaire
+        cmd = f"dersudo du- root -c 'chown {user}:{group} {path}'"
+        result = self._execute_ssh(app, env, cmd)
+        if result['code'] != 0:
+            print(f"⚠️  Impossible de changer le propriétaire: {result['stderr']}")
+        
+        # Changer les permissions
+        if mode:
+            cmd = f"dersudo du- root -c 'chmod {mode} {path}'"
+            result = self._execute_ssh(app, env, cmd)
+            if result['code'] != 0:
+                print(f"⚠️  Impossible de changer les permissions: {result['stderr']}")
     
     def _copy_remote_to_local(self):
         """Copie d'un remote vers le local"""
@@ -231,86 +259,94 @@ EXEMPLES:
         
         if self.target_user:
             print(f"   👤 En tant que : {self.target_user}")
+        if self.mode:
+            print(f"   🔒 Mode : {self.mode}")
         
-        # Vérifier si destination est un répertoire
+        # Déterminer la destination finale
         dst_is_dir = os.path.isdir(self.destination) or self.destination.endswith('/')
         if dst_is_dir:
-            # Déterminer le nom du fichier/répertoire
             base_name = os.path.basename(self.src_path)
             dest_path = os.path.join(self.destination, base_name)
         else:
             dest_path = self.destination
         
-        # Si c'est un répertoire et qu'on n'a pas -r
-        if self.recursive:
-            self._copy_remote_dir_to_local(dest_path)
-        else:
-            self._copy_remote_file_to_local(dest_path)
-    
-    def _copy_remote_file_to_local(self, dest_path):
-        """Copie un fichier remote vers le local"""
-        # Construire la commande de lecture
         if self.target_user:
-            cmd = f"dersudo du- {self.target_user} -c \"cat {self.src_path}\""
+            self._copy_remote_to_local_with_sudo(dest_path)
         else:
-            cmd = f"cat {self.src_path}"
+            self._copy_remote_to_local_without_sudo(dest_path)
         
-        # Exécuter la commande et récupérer le contenu
-        result = self._execute_ssh(self.src_app, self.src_env, cmd)
-        
-        if result is None:
-            sys.exit(1)
-        
-        if result['code'] != 0:
-            print(f"❌ Erreur lors de la lecture de {self.src_path}")
-            print(result['stderr'])
-            sys.exit(1)
-        
-        # Écrire le fichier localement
-        try:
-            with open(dest_path, 'w') as f:
-                f.write(result['stdout'])
-            print(f"✅ Copie réussie : {dest_path}")
-        except Exception as e:
-            print(f"❌ Erreur lors de l'écriture locale : {e}")
-            sys.exit(1)
+        # Appliquer les permissions locales si mode spécifié
+        if self.mode and os.path.exists(dest_path):
+            os.chmod(dest_path, int(self.mode, 8))
     
-    def _copy_remote_dir_to_local(self, dest_path):
-        """Copie un répertoire remote vers le local"""
-        # Utiliser tar pour compresser le répertoire
-        if self.target_user:
-            cmd = f"dersudo du- {self.target_user} -c \"tar czf - -C {os.path.dirname(self.src_path)} {os.path.basename(self.src_path)}\""
-        else:
-            cmd = f"tar czf - -C {os.path.dirname(self.src_path)} {os.path.basename(self.src_path)}"
+    def _copy_remote_to_local_without_sudo(self, dest_path):
+        """Copie sans changement d'utilisateur (scp direct)"""
+        user, host, port = self._get_remote_info(self.src_app, self.src_env)
         
-        result = self._execute_ssh(self.src_app, self.src_env, cmd)
+        cmd = f"scp -P {port} {user}@{host}:{self.src_path} {dest_path}"
+        if self.verbose:
+            cmd = f"scp -v -P {port} {user}@{host}:{self.src_path} {dest_path}"
         
-        if result is None:
+        print(f"🔧 {cmd}")
+        result = subprocess.call(cmd, shell=True)
+        
+        if result != 0:
+            print(f"❌ Erreur lors de la copie")
             sys.exit(1)
         
-        if result['code'] != 0:
-            print(f"❌ Erreur lors de la lecture du répertoire {self.src_path}")
-            print(result['stderr'])
-            sys.exit(1)
+        print(f"✅ Copie réussie : {dest_path}")
+    
+    def _copy_remote_to_local_with_sudo(self, dest_path):
+        """Copie avec changement d'utilisateur (via /tmp + scp)"""
+        user, host, port = self._get_remote_info(self.src_app, self.src_env)
+        temp_name = f"tmp_copy_{uuid4().hex}"
+        remote_temp = f"/tmp/{temp_name}"
         
-        # Sauvegarder le tar
-        tar_file = f"/tmp/copy_{uuid4().hex}.tar.gz"
         try:
-            with open(tar_file, 'w') as f:
-                f.write(result['stdout'])
+            if self.recursive:
+                # Répertoire : utiliser tar
+                print("📦 Compression du répertoire...")
+                cmd = f"dersudo du- {self.target_user} -c 'tar czf {remote_temp} -C {os.path.dirname(self.src_path)} {os.path.basename(self.src_path)}'"
+                result = self._execute_ssh(self.src_app, self.src_env, cmd)
+                if result['code'] != 0:
+                    raise Exception(f"Erreur lors de la compression: {result['stderr']}")
+            else:
+                # Fichier : copie simple
+                cmd = f"dersudo du- {self.target_user} -c 'cp {self.src_path} {remote_temp}'"
+                result = self._execute_ssh(self.src_app, self.src_env, cmd)
+                if result['code'] != 0:
+                    raise Exception(f"Erreur lors de la copie vers /tmp: {result['stderr']}")
             
-            # Extraire le tar
-            os.makedirs(dest_path, exist_ok=True)
-            subprocess.call(f"tar xzf {tar_file} -C {dest_path}", shell=True)
+            # Ouvrir les droits pour lecture
+            cmd = f"dersudo du- {self.target_user} -c 'chmod 644 {remote_temp}'"
+            self._execute_ssh(self.src_app, self.src_env, cmd)
+            
+            # Télécharger avec scp
+            print("📤 Téléchargement...")
+            scp_cmd = f"scp -P {port} {user}@{host}:{remote_temp} {dest_path}"
+            if self.verbose:
+                scp_cmd = f"scp -v -P {port} {user}@{host}:{remote_temp} {dest_path}"
+            result = subprocess.call(scp_cmd, shell=True)
+            
+            if result != 0:
+                raise Exception("Erreur lors du téléchargement")
+            
+            # Si c'était un répertoire, extraire
+            if self.recursive:
+                print("📦 Extraction...")
+                os.makedirs(dest_path, exist_ok=True)
+                subprocess.call(f"tar xzf {dest_path} -C {os.path.dirname(dest_path)}", shell=True)
+                os.remove(dest_path)
             
             print(f"✅ Copie réussie : {dest_path}")
+            
         except Exception as e:
-            print(f"❌ Erreur lors de l'extraction : {e}")
+            print(f"❌ Erreur: {e}")
             sys.exit(1)
         finally:
-            # Nettoyer
-            if os.path.exists(tar_file):
-                os.remove(tar_file)
+            # Nettoyage systématique
+            print("🧹 Nettoyage...")
+            self._execute_ssh(self.src_app, self.src_env, f"rm -f {remote_temp}")
     
     def _copy_local_to_remote(self):
         """Copie du local vers un remote"""
@@ -318,6 +354,8 @@ EXEMPLES:
         
         if self.target_user:
             print(f"   👤 En tant que : {self.target_user}")
+        if self.mode:
+            print(f"   🔒 Mode : {self.mode}")
         
         # Vérifier si source est un répertoire
         if os.path.isdir(self.source):
@@ -326,183 +364,122 @@ EXEMPLES:
                 sys.exit(1)
             self._copy_local_dir_to_remote()
         else:
-            self._copy_local_file_to_remote()
+            if self.target_user:
+                self._copy_local_file_to_remote_with_sudo()
+            else:
+                self._copy_local_file_to_remote_without_sudo()
     
-    def _copy_local_file_to_remote(self):
-        """Copie un fichier local vers le remote"""
-        # Lire le fichier local
-        try:
-            with open(self.source, 'r') as f:
-                content = f.read()
-        except Exception as e:
-            print(f"❌ Erreur lors de la lecture de {self.source} : {e}")
-            sys.exit(1)
+    def _copy_local_file_to_remote_without_sudo(self):
+        """Copie sans changement d'utilisateur (scp direct)"""
+        user, host, port = self._get_remote_info(self.dst_app, self.dst_env)
         
-        # Construire la commande d'écriture
-        if self.target_user:
-            cmd = f"dersudo du- {self.target_user} -c \"cat > {self.dst_path}\""
-        else:
-            cmd = f"cat > {self.dst_path}"
+        cmd = f"scp -P {port} {self.source} {user}@{host}:{self.dst_path}"
+        if self.verbose:
+            cmd = f"scp -v -P {port} {self.source} {user}@{host}:{self.dst_path}"
         
-        # Exécuter la commande avec input
-        result = self._execute_ssh(self.dst_app, self.dst_env, cmd, content)
+        print(f"🔧 {cmd}")
+        result = subprocess.call(cmd, shell=True)
         
-        if result is None:
-            sys.exit(1)
-        
-        if result['code'] != 0:
-            print(f"❌ Erreur lors de l'écriture de {self.dst_path}")
-            print(result['stderr'])
+        if result != 0:
+            print(f"❌ Erreur lors de la copie")
             sys.exit(1)
         
         print(f"✅ Copie réussie : {self.dst_app}:{self.dst_env}:{self.dst_path}")
     
-    def _copy_local_dir_to_remote(self):
-        """Copie un répertoire local vers le remote"""
-        # Créer un tar du répertoire local
-        tar_file = f"/tmp/copy_{uuid4().hex}.tar.gz"
-        try:
-            subprocess.call(f"tar czf {tar_file} -C {os.path.dirname(self.source)} {os.path.basename(self.source)}", shell=True)
-            
-            # Lire le tar
-            with open(tar_file, 'r') as f:
-                content = f.read()
-        except Exception as e:
-            print(f"❌ Erreur lors de la création du tar : {e}")
-            sys.exit(1)
-        finally:
-            if os.path.exists(tar_file):
-                os.remove(tar_file)
-        
-        # Créer le répertoire destination
-        if self.target_user:
-            mkdir_cmd = f"dersudo du- {self.target_user} -c \"mkdir -p {self.dst_path}\""
-        else:
-            mkdir_cmd = f"mkdir -p {self.dst_path}"
-        
-        result = self._execute_ssh(self.dst_app, self.dst_env, mkdir_cmd)
-        if result is None or result['code'] != 0:
-            print(f"❌ Erreur lors de la création du répertoire destination")
-            sys.exit(1)
-        
-        # Extraire le tar sur le remote
-        if self.target_user:
-            cmd = f"dersudo du- {self.target_user} -c \"tar xzf - -C {self.dst_path}\""
-        else:
-            cmd = f"tar xzf - -C {self.dst_path}"
-        
-        result = self._execute_ssh(self.dst_app, self.dst_env, cmd, content)
-        
-        if result is None:
-            sys.exit(1)
-        
-        if result['code'] != 0:
-            print(f"❌ Erreur lors de l'extraction sur {self.dst_path}")
-            print(result['stderr'])
-            sys.exit(1)
-        
-        print(f"✅ Copie réussie : {self.dst_app}:{self.dst_env}:{self.dst_path}")
-    
-    def _copy_remote_to_remote(self):
-        """Copie entre deux remotes via le local"""
-        print(f"📤 Copie de {self.src_app}:{self.src_env}:{self.src_path} → {self.dst_app}:{self.dst_env}:{self.dst_path}")
-        
-        if self.target_user:
-            print(f"   👤 En tant que : {self.target_user}")
-        
-        # Créer un fichier temporaire local
-        temp_file = f"/tmp/copy_{uuid4().hex}"
+    def _copy_local_file_to_remote_with_sudo(self):
+        """Copie avec changement d'utilisateur (via /tmp + scp)"""
+        user, host, port = self._get_remote_info(self.dst_app, self.dst_env)
+        temp_name = f"tmp_copy_{uuid4().hex}"
+        remote_temp = f"/tmp/{temp_name}"
         
         try:
-            # Étape 1 : Remote1 → Local
-            print("📥 Téléchargement depuis la source...")
+            # Upload vers /tmp
+            print("📤 Upload vers /tmp...")
+            scp_cmd = f"scp -P {port} {self.source} {user}@{host}:{remote_temp}"
+            if self.verbose:
+                scp_cmd = f"scp -v -P {port} {self.source} {user}@{host}:{remote_temp}"
+            result = subprocess.call(scp_cmd, shell=True)
             
-            if self.recursive:
-                # Pour répertoire, utiliser tar
-                if self.target_user:
-                    cmd = f"dersudo du- {self.target_user} -c \"tar czf - -C {os.path.dirname(self.src_path)} {os.path.basename(self.src_path)}\""
-                else:
-                    cmd = f"tar czf - -C {os.path.dirname(self.src_path)} {os.path.basename(self.src_path)}"
-                
-                result = self._execute_ssh(self.src_app, self.src_env, cmd)
-                if result is None or result['code'] != 0:
-                    print(f"❌ Erreur lors de la lecture de {self.src_path}")
-                    sys.exit(1)
-                
-                with open(temp_file + '.tar.gz', 'w') as f:
-                    f.write(result['stdout'])
-            else:
-                # Pour fichier, utiliser cat
-                if self.target_user:
-                    cmd = f"dersudo du- {self.target_user} -c \"cat {self.src_path}\""
-                else:
-                    cmd = f"cat {self.src_path}"
-                
-                result = self._execute_ssh(self.src_app, self.src_env, cmd)
-                if result is None or result['code'] != 0:
-                    print(f"❌ Erreur lors de la lecture de {self.src_path}")
-                    sys.exit(1)
-                
-                with open(temp_file, 'w') as f:
-                    f.write(result['stdout'])
+            if result != 0:
+                raise Exception("Erreur lors de l'upload")
             
-            # Étape 2 : Local → Remote2
-            print("📤 Envoi vers la destination...")
+            # Créer le répertoire destination si nécessaire
+            dst_dir = os.path.dirname(self.dst_path)
+            if dst_dir:
+                cmd = f"dersudo du- {self.target_user} -c 'mkdir -p {dst_dir}'"
+                self._execute_ssh(self.dst_app, self.dst_env, cmd)
             
-            if self.recursive:
-                # Extraire le tar sur le remote
-                if self.target_user:
-                    mkdir_cmd = f"dersudo du- {self.target_user} -c \"mkdir -p {self.dst_path}\""
-                else:
-                    mkdir_cmd = f"mkdir -p {self.dst_path}"
-                
-                result = self._execute_ssh(self.dst_app, self.dst_env, mkdir_cmd)
-                if result is None or result['code'] != 0:
-                    print(f"❌ Erreur lors de la création du répertoire destination")
-                    sys.exit(1)
-                
-                with open(temp_file + '.tar.gz', 'r') as f:
-                    content = f.read()
-                
-                if self.target_user:
-                    cmd = f"dersudo du- {self.target_user} -c \"tar xzf - -C {self.dst_path}\""
-                else:
-                    cmd = f"tar xzf - -C {self.dst_path}"
-                
-                result = self._execute_ssh(self.dst_app, self.dst_env, cmd, content)
-            else:
-                # Envoyer le fichier
-                with open(temp_file, 'r') as f:
-                    content = f.read()
-                
-                if self.target_user:
-                    cmd = f"dersudo du- {self.target_user} -c \"cat > {self.dst_path}\""
-                else:
-                    cmd = f"cat > {self.dst_path}"
-                
-                result = self._execute_ssh(self.dst_app, self.dst_env, cmd, content)
+            # Copier vers la destination finale
+            print("📥 Copie vers la destination...")
+            cmd = f"dersudo du- {self.target_user} -c 'cp {remote_temp} {self.dst_path}'"
+            result = self._execute_ssh(self.dst_app, self.dst_env, cmd)
+            if result['code'] != 0:
+                raise Exception(f"Erreur lors de la copie vers {self.dst_path}: {result['stderr']}")
             
-            if result is None or result['code'] != 0:
-                print(f"❌ Erreur lors de l'envoi vers {self.dst_path}")
-                if result:
-                    print(result['stderr'])
-                sys.exit(1)
+            # Appliquer les permissions et le propriétaire
+            self._set_remote_permissions(self.dst_app, self.dst_env, self.dst_path, self.target_user, self.mode)
             
             print(f"✅ Copie réussie : {self.dst_app}:{self.dst_env}:{self.dst_path}")
             
         except Exception as e:
-            print(f"❌ Erreur lors de la copie : {e}")
+            print(f"❌ Erreur: {e}")
             sys.exit(1)
         finally:
-            # Nettoyage des fichiers temporaires
-            for f in [temp_file, temp_file + '.tar.gz']:
-                if os.path.exists(f):
-                    os.remove(f)
-
-def main():
-    """Point d'entrée pour l'outil copy"""
-    tool = CopyTool(sys.argv[1:])
-    tool.run()
-
-if __name__ == "__main__":
-    main()
+            # Nettoyage systématique
+            print("🧹 Nettoyage...")
+            self._execute_ssh(self.dst_app, self.dst_env, f"rm -f {remote_temp}")
+    
+    def _copy_local_dir_to_remote(self):
+        """Copie un répertoire local vers le remote"""
+        user, host, port = self._get_remote_info(self.dst_app, self.dst_env)
+        temp_name = f"tmp_copy_{uuid4().hex}"
+        local_temp = f"/tmp/{temp_name}.tar.gz"
+        remote_temp = f"/tmp/{temp_name}.tar.gz"
+        
+        try:
+            # Créer un tar du répertoire local
+            print("📦 Compression du répertoire local...")
+            subprocess.call(f"tar czf {local_temp} -C {os.path.dirname(self.source)} {os.path.basename(self.source)}", shell=True)
+            
+            # Upload vers /tmp sur le remote
+            print("📤 Upload vers /tmp...")
+            scp_cmd = f"scp -P {port} {local_temp} {user}@{host}:{remote_temp}"
+            if self.verbose:
+                scp_cmd = f"scp -v -P {port} {local_temp} {user}@{host}:{remote_temp}"
+            result = subprocess.call(scp_cmd, shell=True)
+            
+            if result != 0:
+                raise Exception("Erreur lors de l'upload")
+            
+            # Créer le répertoire destination
+            print("📥 Création du répertoire destination...")
+            cmd = f"dersudo du- {self.target_user} -c 'mkdir -p {self.dst_path}'"
+            self._execute_ssh(self.dst_app, self.dst_env, cmd)
+            
+            # Extraire le tar sur le remote
+            print("📦 Extraction sur le remote...")
+            cmd = f"dersudo du- {self.target_user} -c 'tar xzf {remote_temp} -C {self.dst_path}'"
+            result = self._execute_ssh(self.dst_app, self.dst_env, cmd)
+            if result['code'] != 0:
+                raise Exception(f"Erreur lors de l'extraction: {result['stderr']}")
+            
+            # Appliquer les permissions récursivement
+            if self.mode or self.target_user:
+                print("🔒 Application des permissions...")
+                if self.target_user:
+                    group = self._get_default_group(self.dst_app, self.dst_env, self.target_user)
+                    cmd = f"dersudo du- root -c 'chown -R {self.target_user}:{group} {self.dst_path}'"
+                    self._execute_ssh(self.dst_app, self.dst_env, cmd)
+                if self.mode:
+                    cmd = f"dersudo du- root -c 'chmod -R {self.mode} {self.dst_path}'"
+                    self._execute_ssh(self.dst_app, self.dst_env, cmd)
+            
+            print(f"✅ Copie réussie : {self.dst_app}:{self.dst_env}:{self.dst_path}")
+            
+        except Exception as e:
+            print(f"❌ Erreur: {e}")
+            sys.exit(1)
+        finally:
+            # Nettoyage
+            print("🧹 Nettoyage...")
+            self._execute_ssh(self
